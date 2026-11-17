@@ -5,6 +5,7 @@ This is a prototype, not a validated early-warning system.
 """
 
 from pathlib import Path
+from typing import Optional
 import logging
 import math
 
@@ -12,10 +13,6 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 import pandas as pd
-
-from typing import Optional
-str_SensorName: Optional[str] = None
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,19 +23,8 @@ def load_sensor_data(pth_Dataset: Path, int_SheetIndex: int) -> pd.DataFrame:
         raise FileNotFoundError(f"Dataset not found: {pth_Dataset}")
 
     df_SensorData: pd.DataFrame = pd.read_excel(
-
         pth_Dataset, sheet_name=int_SheetIndex
     )
-    print("Dataset shape:", df_SensorData.shape)
-
-    print("\nColumn names:")
-    print(df_SensorData.columns.tolist())
-
-    print("\nColumn data types:")
-    print(df_SensorData.dtypes)
-
-    print("\nFirst five rows:")
-    print(df_SensorData.head())
     if df_SensorData.empty:
         raise ValueError("The selected worksheet contains no rows.")
 
@@ -145,11 +131,54 @@ def find_alarm_start_rows(
     if flt_DecisionThreshold <= 0 or not math.isfinite(flt_DecisionThreshold):
         raise ValueError("flt_DecisionThreshold must be positive and finite.")
 
-    ser_AboveThreshold: pd.Series = ser_CusumScores.ge(flt_DecisionThreshold)
+    ser_AboveThreshold: pd.Series = ser_CusumScores.gt(flt_DecisionThreshold)
     ser_NewAlarms: pd.Series = ser_AboveThreshold & ~ser_AboveThreshold.shift(
         fill_value=False
     )
     return [int(int_RowIndex) for int_RowIndex in ser_CusumScores.index[ser_NewAlarms]]
+
+def extract_alarm_intervals(
+    ser_CusumScores: pd.Series,
+    flt_DecisionThreshold: float
+) -> list[tuple[int, int]]:
+    """
+    Identify continuous periods where the CUSUM score exceeds
+    the decision threshold.
+
+    Returns inclusive (start, end) positional indices.
+    Missing readings are treated as inactive alarms.
+    """
+    if flt_DecisionThreshold <= 0 or not math.isfinite(flt_DecisionThreshold):
+        raise ValueError("Decision threshold must be positive and finite.")
+
+    lst_AlarmIntervals: list[tuple[int, int]] = []
+    int_AlarmStart: Optional[int] = None
+
+    for int_Position, flt_Score in enumerate(ser_CusumScores):
+
+        bol_AlarmActive: bool = (
+            pd.notna(flt_Score)
+            and flt_Score > flt_DecisionThreshold
+        )
+
+        if bol_AlarmActive and int_AlarmStart is None:
+            # A new alarm period begins
+            int_AlarmStart = int_Position
+
+        elif not bol_AlarmActive and int_AlarmStart is not None:
+            # The current alarm period ends
+            lst_AlarmIntervals.append(
+                (int_AlarmStart, int_Position - 1)
+            )
+            int_AlarmStart = None
+
+    # Handle an alarm still active at the final reading
+    if int_AlarmStart is not None:
+        lst_AlarmIntervals.append(
+            (int_AlarmStart, len(ser_CusumScores) - 1)
+        )
+
+    return lst_AlarmIntervals
 
 
 def get_plot_axis(df_SensorData: pd.DataFrame) -> pd.Index:
@@ -223,39 +252,38 @@ def plot_results(
 
 
 def main() -> None:
-    """Run exploratory CUSUM detection against one Excel temperature sensor."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    """Run exploratory upper-sided CUSUM for one temperature sensor."""
+    # False = concise results; True = detailed diagnostic tables and alarm times.
+    bol_ShowDiagnostics: bool = False
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
-    # Change the filename to the actual workbook on your Desktop.
+    # Workbook and sensor configuration
     pth_Dataset: Path = Path.home() / "Desktop" / "Synthetic_Data_Generation.xlsx"
-    int_SheetIndex: int = 2
-    str_RequestedSensorName: Optional[str] = None  # Or use an exact name, e.g. "Sensor_001"
+    int_SheetIndex: int = 2  # Sensor_Data worksheet
+    str_RequestedSensorName: Optional[str] = None  # Defaults to first numeric sensor
 
-    # 288 readings x 5 minutes = 24 hours (assuming no missing timestamps).
+    # 288 readings x 5 minutes = 24 hours (assumes regular timestamps).
     int_BaselineReadings: int = 288
     flt_ReferenceValue: float = 0.5
     flt_DecisionThreshold: float = 5.0
-    #get correct sheet from spreadsheet
-    with pd.ExcelFile(pth_Dataset) as excel_file:
-        lst_SheetNames: list[str] = excel_file.sheet_names
-        print("Available worksheets:", lst_SheetNames)
+
+    # Load data
+    if bol_ShowDiagnostics:
+        with pd.ExcelFile(pth_Dataset) as excel_file:
+            lst_SheetNames: list[str] = excel_file.sheet_names
+            print("Available worksheets:", lst_SheetNames)
 
     df_SensorData: pd.DataFrame = load_sensor_data(pth_Dataset, int_SheetIndex)
     str_SensorName: str = select_sensor(df_SensorData, str_RequestedSensorName)
     ser_Temperatures: pd.Series = pd.to_numeric(
         df_SensorData[str_SensorName], errors="coerce"
     ).replace([float("inf"), float("-inf")], float("nan"))
-
     int_MissingReadings: int = int(ser_Temperatures.isna().sum())
-    LOGGER.info("Sensor: %s | Rows: %d | Missing: %d",
-                str_SensorName, len(ser_Temperatures), int_MissingReadings)
 
+    # Estimate the fixed baseline and calculate CUSUM scores.
     flt_BaselineMean, flt_BaselineStd = estimate_baseline(
         ser_Temperatures, int_BaselineReadings
     )
-    LOGGER.info("Baseline: mean=%.3f°C, std=%.3f°C",
-                flt_BaselineMean, flt_BaselineStd)
-
     ser_TestTemperatures: pd.Series = ser_Temperatures.iloc[int_BaselineReadings:]
     ser_CusumScores: pd.Series = calculate_upper_cusum(
         ser_TestTemperatures,
@@ -266,10 +294,101 @@ def main() -> None:
     lst_AlarmRows: list[int] = find_alarm_start_rows(
         ser_CusumScores, flt_DecisionThreshold
     )
-    LOGGER.info("CUSUM alarm episodes: %d", len(lst_AlarmRows))
-    if lst_AlarmRows:
-        LOGGER.info("First alarm at worksheet data row index: %d", lst_AlarmRows[0])
+    lst_AlarmIntervals: list[tuple[int, int]] = extract_alarm_intervals(
+        ser_CusumScores, flt_DecisionThreshold
+    )
 
+    # Load injected anomaly labels for reference (not validated detection scores).
+    df_GroundTruth: pd.DataFrame = pd.read_excel(
+        pth_Dataset, sheet_name="Ground_Truth_Spikes"
+    )
+    df_SensorEvents: pd.DataFrame = df_GroundTruth.loc[
+        df_GroundTruth["sensor"] == str_SensorName
+    ].copy()
+    df_SensorEvents["start"] = pd.to_datetime(df_SensorEvents["start"])
+    df_SensorEvents["end"] = pd.to_datetime(df_SensorEvents["end"])
+    df_SensorEvents = df_SensorEvents.sort_values(by="start")
+
+    # Concise terminal summary for every run.
+    print("\n========== CUSUM ANALYSIS ==========")
+    print(f"Sensor: {str_SensorName}")
+    print(f"Readings: {len(ser_Temperatures)}")
+    print(f"Missing readings: {int_MissingReadings}")
+    print(f"\nBaseline mean: {flt_BaselineMean:.3f}°C")
+    print(f"Baseline standard deviation: {flt_BaselineStd:.3f}°C")
+    print(f"\nReference value (k): {flt_ReferenceValue}")
+    print(f"Decision threshold (h): {flt_DecisionThreshold}")
+    print(f"\nGround-truth events: {len(df_SensorEvents)}")
+    print(f"Alarm intervals: {len(lst_AlarmIntervals)}")
+    print(f"Maximum CUSUM score: {ser_CusumScores.max():.1f}")
+    print("Note: alarm intervals are not validated event-level detections.")
+
+    # Detailed diagnostics remain available without cluttering normal runs.
+    if bol_ShowDiagnostics:
+        print("\n--- DATASET INSPECTION ---")
+        print("Dataset shape:", df_SensorData.shape)
+        print("Column names:", df_SensorData.columns.tolist())
+        print("Column data types:\n", df_SensorData.dtypes)
+        print("First five rows:\n", df_SensorData.head().to_string(index=False))
+
+        print("\n--- GROUND TRUTH ---")
+        print("Columns:", df_GroundTruth.columns.tolist())
+        print("First ten rows:\n", df_GroundTruth.head(10).to_string(index=False))
+        print(f"\nGround-truth events for {str_SensorName}:")
+        print(df_SensorEvents.to_string(index=False))
+        print("\nGround-truth event types:\n", df_GroundTruth["type"].value_counts())
+
+        ser_Timestamps: pd.Series = pd.to_datetime(df_SensorData["DateTime"])
+        ser_DailyMeans: pd.Series = ser_Temperatures.groupby(
+            ser_Timestamps.dt.normalize()
+        ).mean()
+        ser_DailyDeviations: pd.Series = ser_DailyMeans - flt_BaselineMean
+        df_DailySummary: pd.DataFrame = pd.DataFrame({
+            "Daily Mean (°C)": ser_DailyMeans,
+            "Difference from Baseline (°C)": ser_DailyDeviations,
+        })
+
+        df_CusumDiagnostic: pd.DataFrame = pd.DataFrame({
+            "DateTime": ser_Timestamps.iloc[int_BaselineReadings:].to_numpy(),
+            "CUSUM": ser_CusumScores.to_numpy(),
+        })
+        df_CusumDaily: pd.DataFrame = (
+            df_CusumDiagnostic.set_index("DateTime")["CUSUM"]
+            .resample("D")
+            .agg(["first", "max", "last"])
+        )
+        print("\n--- DAILY CUSUM SCORES ---")
+        print(df_CusumDaily.round(1).to_string())
+        print("\n--- DAILY TEMPERATURE SUMMARY ---")
+        print(df_DailySummary.round(3).to_string())
+
+        print("\n--- ALARM INTERVALS ---")
+        for int_Start, int_End in lst_AlarmIntervals:
+            int_OriginalStart: int = int_BaselineReadings + int_Start
+            int_OriginalEnd: int = int_BaselineReadings + int_End
+            tms_StartTime: pd.Timestamp = ser_Timestamps.iloc[int_OriginalStart]
+            tms_EndTime: pd.Timestamp = ser_Timestamps.iloc[int_OriginalEnd]
+            print(f"Alarm interval: {tms_StartTime} to {tms_EndTime}")
+
+        print("\n--- NEW ALARM STARTS VS GROUND TRUTH ---")
+        for int_AlarmRow in lst_AlarmRows:
+            # The current workbook has an unchanged RangeIndex (0..8639).
+            tms_AlarmTime: pd.Timestamp = ser_Timestamps.iloc[int_AlarmRow]
+            ser_MatchingEvents: pd.Series = (
+                (df_SensorEvents["start"] <= tms_AlarmTime)
+                & (df_SensorEvents["end"] >= tms_AlarmTime)
+            )
+            lst_EventIds: list[str] = (
+                df_SensorEvents.loc[ser_MatchingEvents, "event_id"]
+                .astype(str)
+                .tolist()
+            )
+            str_Result: str = (
+                ", ".join(lst_EventIds) if lst_EventIds else "Outside recorded event"
+            )
+            print(f"{tms_AlarmTime}: {str_Result}")
+
+    # Preserve the original graph.
     idx_PlotAxis: pd.Index = get_plot_axis(df_SensorData)
     pth_OutputPlot: Path = pth_Dataset.parent / "cusum_sensor_results.png"
     plot_results(
@@ -283,6 +402,7 @@ def main() -> None:
         int_BaselineReadings,
         pth_OutputPlot,
     )
+    print(f"\nPlot saved: {pth_OutputPlot}")
 
 
 if __name__ == "__main__":
